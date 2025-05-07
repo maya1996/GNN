@@ -1,13 +1,14 @@
 import os
 import torch
+import torch.nn as nn
+import torch.optim as optim 
 import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data
 import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score
 import numpy as np
-import torch.nn as nn
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import GCNConv, global_mean_pool
 from torch_geometric.transforms import ToUndirected
 from torch_geometric.utils import to_undirected
 
@@ -18,12 +19,19 @@ print(f"🖥️ Using device: {device}")
 def data_preprocessing():
     data_list = torch.load('atomic_charge_dataset_full.pt')
     print(f"📦 Loaded {len(data_list)} graphs")
+    torch.manual_seed(42)
+    np.random.seed(42)
+    np.random.shuffle(data_list)
 
 # Split dataset
-    train_data = data_list[:int(0.8 * len(data_list))]
-    val_data = data_list[int(0.8 * len(data_list)):int(0.9 * len(data_list))]
-    test_data = data_list[int(0.9 * len(data_list)):]
-    print(f"📊 Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
+    train_size= int(0.8 * len(data_list))
+    val_size = int(0.1 * len(data_list))
+    test_size = len(dataset) - train_size - val_size
+  
+    train_data = data_list[:train_size]
+    val_data = data_list[train_size:train_size + val_size]
+    test_data = data_list[train_size + val_size:]
+
 
     train_loader = DataLoader(train_data, batch_size=64, shuffle=True)
     val_loader = DataLoader(val_data, batch_size=64)
@@ -31,47 +39,48 @@ def data_preprocessing():
 
     return train_loader, val_loader, test_loader
 
+def get_in_channels(dataset):
+    for data in dataset:
+        return data.num_node_features
+
 class Hyperparameters:
     def __init__(self):
-        self.num_epochs = 100
-        self.learning_rate = 1e-3
-        self.weight_decay = 5e-4
+        self.num_epochs = 250
+        self.learning_rate = 0.001
+        self.weight_decay = 1e-4
     
 
 # Define GCN model
-class GCNRegressor(torch.nn.Module):
-    def __init__(self, input_dim=1, hidden_dim=64):
-        super().__init__()
-        self.conv1 = GCNConv(input_dim, hidden_dim)
-        self.bn1 = torch.nn.BatchNorm1d(hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
-        self.bn2 = torch.nn.BatchNorm1d(hidden_dim)
-        self.conv3 = GCNConv(hidden_dim, 1)
-        self.dropout = torch.nn.Dropout(0.5)
+class GCN(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels=128, out_channels=1, dropout=0.3):
+        super(GCN, self).__init__()
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, hidden_channels)
+        self.lin = torch.nn.Linear(hidden_channels, out_channels)
+        self.dropout = dropout
 
-    def forward(self, data):
-        x, edge_index = data.x.float(), data.edge_index
-        x = F.relu(self.bn1(self.conv1(x, edge_index)))
-        x = self.dropout(x)
-        x = F.relu(self.bn2(self.conv2(x, edge_index)))
-        x = self.dropout(x)
-        x = self.conv3(x, edge_index)
-        return x.view(-1)
-
+    def forward(self, x, edge_index, batch):
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.conv2(x, edge_index)
+        x = global_mean_pool(x, batch)  # Pool to graph-level representation
+        x = self.lin(x)
+        return x
 
 # Training function
 def train(train_loader, model, optimizer, val_loader, hp, device):
     loss_fn = nn.MSELoss()
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-5)
     train_losses, val_losses, acc_val = [], [], []
     for epoch in range(1, hp.num_epochs + 1):
         model.train()
         train_loss = 0.0
-        for batch in train_loader:
-            batch = batch.to(device)
+        for data in train_loader:
+            data = data.to(device)
             optimizer.zero_grad()
-            out = model(batch)
-            loss = loss_fn(out, batch.y.view(-1))
+            out = model(data.x, data.edge_index, data.batch)
+            loss = loss_fn(out.view(-1), data.y.view(-1))
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
@@ -83,36 +92,33 @@ def train(train_loader, model, optimizer, val_loader, hp, device):
         val_losses.append(val_loss)
         acc_val.append(val_acc)
         print(f"Epoch{epoch+1}: Train loss:{avg_train_loss:.4f} Validation Loss:{val_loss:.4f} Accuracy:{val_acc:.2f}%")
-        plot_losses(train_losses, val_losses)
-
-
+    
+    plot_chart(range(1, hp.num_epochs + 1), train_losses, val_losses, acc_val)
 
 # Evaluation function
 def evaluate(model, loader, device):
     model.eval()
-    total_loss = 0.0
     true, pred = [], []
-    criterion = nn.MSELoss()
    
-  
     with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
-            out = model(batch)
-            loss = criterion(out, batch.y.view(-1))
-            total_loss += loss.item()
-            true.append(batch.y.view(-1).detach().cpu())
-            pred.append(out.detach().cpu())
+        for data in loader:
+            data = data.to(device)
+            out = model(data.x, data.edge_index, data.batch)
+            true.append(data.y.view(-1).cpu())
+            pred.append(out.view(-1).cpu())
 
-    true = torch.cat(true).numpy()
-    pred = torch.cat(pred).numpy()
-    avg_test_loss = total_loss / len(loader)
+    true = torch.cat(true)
+    pred = torch.cat(pred)
+
+    loss = F.l1_loss(true, pred).item()
+    total_loss += loss.item()
     acc = r2_score(true, pred)
-    return avg_test_loss, acc
+
+    return loss.item(), acc
            
 
 # Plotting function
-def plot_losses(train_losses, val_losses):
+def plot_chart(epochs, train_losses, val_losses, accuracies):
     plt.figure(figsize=(8,5))
     plt.plot(train_losses, label='Train Loss')
     plt.plot(val_losses, label='Validation Loss')
@@ -125,14 +131,25 @@ def plot_losses(train_losses, val_losses):
     plt.show()
     plt.close()
 
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, accuracies, label='Accuracy')
+    plt.title('Model Accuracy')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy (%)')
+    plt.savefig("loss_acc.png")
+    plt.legend()
+    plt.show()
+    plt.close()
+
 
 
 if __name__ == "__main__":
     hp = Hyperparameters()
     train_loader, val_loader, test_loader = data_preprocessing()
-    model = GCNRegressor().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=hp.learning_rate, weight_decay=hp.weight_decay)
+    node_features = get_in_channels(train_loader.dataset)
+    model = GCN(node_features).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=hp.learning_rate,weight_decay=hp.weight_decay)
     train(train_loader, model, optimizer, val_loader, hp, device)
     print("✅ Model training complete.")
     test_loss, test_acc = evaluate(model, test_loader, device)
-    print(f"📉 Test Loss: {test_loss:.4f},R² Score: {test_acc:.4f}")
+    print(f"📉 Test Loss: {test_loss:.4f}, Test_Accuarcy: {test_acc:.2f}%")
